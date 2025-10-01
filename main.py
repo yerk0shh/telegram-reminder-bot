@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import ssl
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart, Command
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -13,23 +14,34 @@ from sqlalchemy import Column, Integer, String, BigInteger, select
 # === Логирование ===
 logging.basicConfig(level=logging.INFO)
 
-# === Загружаем переменные ===
+# === Загружаем переменные окружения ===
 load_dotenv()
 API_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_IDS = set(map(int, os.getenv("ADMIN_IDS", "").split(",")))
-DATABASE_URL = os.getenv("DATABASE_URL")
+
+# === Настройки БД ===
+DATABASE_URL = os.getenv("DATABASE_URL")  # без ?sslmode=require
+
+# Создаём SSL-контекст для asyncpg
+ssl_context = ssl.create_default_context()
+ssl_context.check_hostname = False
+ssl_context.verify_mode = ssl.CERT_NONE
+
+engine = create_async_engine(
+    DATABASE_URL,
+    echo=False,
+    connect_args={"ssl": ssl_context}  # передаём SSL
+)
+SessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 # === Настройки бота и планировщика ===
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
 scheduler = AsyncIOScheduler(timezone="Asia/Almaty")
 
-# === Настройки БД ===
-Base = declarative_base()
-engine = create_async_engine(DATABASE_URL, echo=False)
-SessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-
 # === Модели ===
+Base = declarative_base()
+
 class Subscriber(Base):
     __tablename__ = "subscribers"
     id = Column(BigInteger, primary_key=True, unique=True, nullable=False)
@@ -72,7 +84,6 @@ async def add_task(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
         await message.answer("⛔ У тебя нет прав для добавления задач.")
         return
-
     try:
         _, time_str, *task_text = message.text.split(" ")
         hour, minute = map(int, time_str.split(":"))
@@ -84,7 +95,6 @@ async def add_task(message: types.Message):
             await session.commit()
 
         scheduler.add_job(send_task, "cron", hour=hour, minute=minute, args=[task_message])
-
         await message.answer(f"✅ Задача добавлена: {time_str} → {task_message}")
 
     except Exception as e:
