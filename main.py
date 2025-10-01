@@ -5,35 +5,34 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart, Command
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
+
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy import Column, Integer, String
+from sqlalchemy import Column, Integer, String, BigInteger, select
 
-# Логирование
+# === Логирование ===
 logging.basicConfig(level=logging.INFO)
 
-# Загружаем переменные
+# === Загружаем переменные ===
 load_dotenv()
 API_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_IDS = set(map(int, os.getenv("ADMIN_IDS", "").split(",")))
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Настройки бота и планировщика
+# === Настройки бота и планировщика ===
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
 scheduler = AsyncIOScheduler(timezone="Asia/Almaty")
 
-# Настройки БД
+# === Настройки БД ===
 Base = declarative_base()
 engine = create_async_engine(DATABASE_URL, echo=False)
 SessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
-
-# === Модели базы данных ===
+# === Модели ===
 class Subscriber(Base):
     __tablename__ = "subscribers"
-    id = Column(Integer, primary_key=True)
-
+    id = Column(BigInteger, primary_key=True, unique=True, nullable=False)
 
 class Task(Base):
     __tablename__ = "tasks"
@@ -41,27 +40,22 @@ class Task(Base):
     time = Column(String, nullable=False)
     message = Column(String, nullable=False)
 
-
 # === Вспомогательные функции ===
 async def send_task(task_message: str):
     async with SessionLocal() as session:
-        subs = await session.execute(
-            Subscriber.__table__.select()
-        )
+        subs = await session.execute(select(Subscriber))
         for sub in subs.scalars().all():
             try:
                 await bot.send_message(sub.id, f"⏰ {task_message}")
             except Exception as e:
                 logging.warning(f"Не удалось отправить {sub.id}: {e}")
 
-
 async def schedule_existing_tasks():
     async with SessionLocal() as session:
-        tasks = await session.execute(Task.__table__.select())
+        tasks = await session.execute(select(Task))
         for t in tasks.scalars().all():
             hour, minute = map(int, t.time.split(":"))
             scheduler.add_job(send_task, "cron", hour=hour, minute=minute, args=[t.message])
-
 
 # === Команды ===
 @dp.message(CommandStart())
@@ -72,7 +66,6 @@ async def start(message: types.Message):
             session.add(Subscriber(id=message.from_user.id))
             await session.commit()
     await message.answer("✅ Ты подписан на напоминания!")
-
 
 @dp.message(Command("add"))
 async def add_task(message: types.Message):
@@ -98,13 +91,12 @@ async def add_task(message: types.Message):
         logging.error(e)
         await message.answer("⚠️ Ошибка! Формат: `/add 10:00 текст`", parse_mode="Markdown")
 
-
 @dp.message(Command("list"))
 async def list_tasks(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
         return
     async with SessionLocal() as session:
-        tasks = await session.execute(Task.__table__.select())
+        tasks = await session.execute(select(Task))
         tasks = tasks.scalars().all()
         if not tasks:
             await message.answer("📋 Нет активных задач.")
@@ -113,7 +105,6 @@ async def list_tasks(message: types.Message):
         for i, t in enumerate(tasks, 1):
             text += f"{i}. {t.time} → {t.message}\n"
         await message.answer(text)
-
 
 @dp.message(Command("delete"))
 async def delete_task(message: types.Message):
@@ -124,7 +115,7 @@ async def delete_task(message: types.Message):
         index = int(index_str) - 1
 
         async with SessionLocal() as session:
-            tasks = await session.execute(Task.__table__.select())
+            tasks = await session.execute(select(Task))
             tasks = tasks.scalars().all()
             if index < 0 or index >= len(tasks):
                 raise ValueError("Неверный индекс")
@@ -136,7 +127,6 @@ async def delete_task(message: types.Message):
     except:
         await message.answer("⚠️ Ошибка! Используй: `/delete 1`")
 
-
 # === Запуск ===
 async def main():
     async with engine.begin() as conn:
@@ -146,7 +136,6 @@ async def main():
     scheduler.start()
     logging.info("✅ Бот запущен")
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
