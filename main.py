@@ -1,113 +1,95 @@
 import asyncio
 import logging
 import os
-import ssl
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart, Command
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from dotenv import load_dotenv
-
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy import Column, Integer, String, BigInteger, select
+from sqlalchemy import Column, Integer, BigInteger, Boolean, String, Text, select, delete
+from dotenv import load_dotenv
 
-# === Логирование ===
+# Логирование
 logging.basicConfig(level=logging.INFO)
+load_dotenv
 
-# === Загружаем переменные окружения ===
-load_dotenv()
 API_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_IDS = set(map(int, os.getenv("ADMIN_IDS", "").split(",")))
+ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "").split(","))) 
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-# === Настройки БД ===
-DATABASE_URL = os.getenv("DATABASE_URL")  # без ?sslmode=require
-
-# Создаём SSL-контекст для asyncpg
-ssl_context = ssl.create_default_context()
-ssl_context.check_hostname = False
-ssl_context.verify_mode = ssl.CERT_NONE
-
-engine = create_async_engine(
-    DATABASE_URL,
-    echo=False,
-    connect_args={"ssl": ssl_context}  # передаём SSL
-)
-SessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-
-# === Настройки бота и планировщика ===
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
 scheduler = AsyncIOScheduler(timezone="Asia/Almaty")
 
-# === Модели ===
+# === Настройка базы ===
 Base = declarative_base()
+engine = create_async_engine(DATABASE_URL, echo=False)
+async_session = sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
-class Subscriber(Base):
-    __tablename__ = "subscribers"
-    id = Column(BigInteger, primary_key=True, unique=True, nullable=False)
+# --- Модели ---
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True)
+    telegram_id = Column(BigInteger, unique=True, nullable=False)
+    is_admin = Column(Boolean, default=False)
 
 class Task(Base):
     __tablename__ = "tasks"
     id = Column(Integer, primary_key=True)
-    time = Column(String, nullable=False)
-    message = Column(String, nullable=False)
+    time = Column(String(5), nullable=False)  # HH:MM
+    message = Column(Text, nullable=False)
 
-# === Вспомогательные функции ===
-async def send_task(task_message: str):
-    async with SessionLocal() as session:
-        subs = await session.execute(select(Subscriber))
-        for sub in subs.scalars().all():
-            try:
-                await bot.send_message(sub.id, f"⏰ {task_message}")
-            except Exception as e:
-                logging.warning(f"Не удалось отправить {sub.id}: {e}")
-
-async def schedule_existing_tasks():
-    async with SessionLocal() as session:
-        tasks = await session.execute(select(Task))
-        for t in tasks.scalars().all():
-            hour, minute = map(int, t.time.split(":"))
-            scheduler.add_job(send_task, "cron", hour=hour, minute=minute, args=[t.message])
-
-# === Команды ===
+# === /start ===
 @dp.message(CommandStart())
 async def start(message: types.Message):
-    async with SessionLocal() as session:
-        exists = await session.get(Subscriber, message.from_user.id)
-        if not exists:
-            session.add(Subscriber(id=message.from_user.id))
+    async with async_session() as session:
+        user = await session.execute(select(User).where(User.telegram_id == message.from_user.id))
+        user = user.scalars().first()
+        if not user:
+            session.add(User(telegram_id=message.from_user.id, is_admin=(message.from_user.id == ADMIN_ID)))
             await session.commit()
+            logging.info(f"Добавлен новый пользователь {message.from_user.id}")
     await message.answer("✅ Ты подписан на напоминания!")
 
+# === /add ===
 @dp.message(Command("add"))
 async def add_task(message: types.Message):
-    if message.from_user.id not in ADMIN_IDS:
-        await message.answer("⛔ У тебя нет прав для добавления задач.")
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("⛔ У тебя нет прав.")
         return
+
     try:
-        _, time_str, *task_text = message.text.split(" ")
+        _, time_str, *task_text = message.text.split(" ", 2)
         hour, minute = map(int, time_str.split(":"))
         task_message = " ".join(task_text)
 
-        async with SessionLocal() as session:
-            task = Task(time=time_str, message=task_message)
-            session.add(task)
+        # Сохраняем в базу
+        async with async_session() as session:
+            session.add(Task(time=time_str, message=task_message))
             await session.commit()
 
-        scheduler.add_job(send_task, "cron", hour=hour, minute=minute, args=[task_message])
+        # Планировщик
+        async def task():
+            async with async_session() as session:
+                users = await session.execute(select(User.telegram_id))
+                for (telegram_id,) in users:
+                    await bot.send_message(telegram_id, f"⏰ {task_message}")
+
+        scheduler.add_job(task, "cron", hour=hour, minute=minute)
         await message.answer(f"✅ Задача добавлена: {time_str} → {task_message}")
 
     except Exception as e:
         logging.error(e)
         await message.answer("⚠️ Ошибка! Формат: `/add 10:00 текст`", parse_mode="Markdown")
 
+# === /list ===
 @dp.message(Command("list"))
 async def list_tasks(message: types.Message):
-    if message.from_user.id not in ADMIN_IDS:
+    if message.from_user.id != ADMIN_ID:
         return
-    async with SessionLocal() as session:
-        tasks = await session.execute(select(Task))
-        tasks = tasks.scalars().all()
+    async with async_session() as session:
+        result = await session.execute(select(Task))
+        tasks = result.scalars().all()
         if not tasks:
             await message.answer("📋 Нет активных задач.")
             return
@@ -116,33 +98,52 @@ async def list_tasks(message: types.Message):
             text += f"{i}. {t.time} → {t.message}\n"
         await message.answer(text)
 
+# === /delete ===
 @dp.message(Command("delete"))
 async def delete_task(message: types.Message):
-    if message.from_user.id not in ADMIN_IDS:
+    if message.from_user.id != ADMIN_ID:
         return
     try:
         _, index_str = message.text.split(" ")
-        index = int(index_str) - 1
+        index = int(index_str)
 
-        async with SessionLocal() as session:
-            tasks = await session.execute(select(Task))
-            tasks = tasks.scalars().all()
-            if index < 0 or index >= len(tasks):
-                raise ValueError("Неверный индекс")
-            task = tasks[index]
+        async with async_session() as session:
+            result = await session.execute(select(Task))
+            tasks = result.scalars().all()
+            if index < 1 or index > len(tasks):
+                await message.answer("⚠️ Нет такой задачи.")
+                return
+            task = tasks[index - 1]
             await session.delete(task)
             await session.commit()
+            await message.answer(f"🗑 Удалена задача: {task.time} → {task.message}")
 
-        await message.answer(f"🗑 Задача удалена: {task.time} → {task.message}")
-    except:
+    except Exception as e:
+        logging.error(e)
         await message.answer("⚠️ Ошибка! Используй: `/delete 1`")
+
+# === Поднять таблицы + загрузить задачи из базы ===
+async def load_tasks():
+    async with async_session() as session:
+        result = await session.execute(select(Task))
+        tasks = result.scalars().all()
+        for task in tasks:
+            hour, minute = map(int, task.time.split(":"))
+
+            async def job(message=task.message):
+                users = await session.execute(select(User.telegram_id))
+                for (telegram_id,) in users:
+                    await bot.send_message(telegram_id, f"⏰ {message}")
+
+            scheduler.add_job(job, "cron", hour=hour, minute=minute)
+        logging.info(f"Загружено {len(tasks)} задач из базы")
 
 # === Запуск ===
 async def main():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
-    await schedule_existing_tasks()
+    await load_tasks()
     scheduler.start()
     logging.info("✅ Бот запущен")
     await dp.start_polling(bot)
