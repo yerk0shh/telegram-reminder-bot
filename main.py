@@ -1,6 +1,8 @@
 import asyncio
 import logging
 import os
+import ssl
+import sys
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart, Command
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -9,23 +11,34 @@ from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy import Column, Integer, BigInteger, Boolean, String, Text, select
 from dotenv import load_dotenv
 
+if sys.platform.startswith("win"):
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 # Логирование
 logging.basicConfig(level=logging.INFO)
 load_dotenv()
 
-# === Переменные окружения ===
 API_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_IDS = set(map(int, os.getenv("ADMIN_IDS", "").split(",")))
+ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "").split(",")))
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# === Настройки бота и планировщика ===
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
 scheduler = AsyncIOScheduler(timezone="Asia/Almaty")
 
 # === Настройка базы ===
 Base = declarative_base()
-engine = create_async_engine(DATABASE_URL, echo=False)
+
+# SSL для Railway
+ssl_context = ssl.create_default_context()
+ssl_context.check_hostname = False
+ssl_context.verify_mode = ssl.CERT_NONE
+
+engine = create_async_engine(
+    DATABASE_URL,
+    echo=False,
+    connect_args={"ssl": ssl_context}
+)
 async_session = sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
 # --- Модели ---
@@ -35,18 +48,20 @@ class User(Base):
     telegram_id = Column(BigInteger, unique=True, nullable=False)
     is_admin = Column(Boolean, default=False)
 
+
 class Task(Base):
     __tablename__ = "tasks"
     id = Column(Integer, primary_key=True)
     time = Column(String(5), nullable=False)  # HH:MM
     message = Column(Text, nullable=False)
 
+
 # === /start ===
 @dp.message(CommandStart())
 async def start(message: types.Message):
     async with async_session() as session:
-        user = await session.execute(select(User).where(User.telegram_id == message.from_user.id))
-        user = user.scalars().first()
+        result = await session.execute(select(User).where(User.telegram_id == message.from_user.id))
+        user = result.scalars().first()
         if not user:
             session.add(User(
                 telegram_id=message.from_user.id,
@@ -56,6 +71,7 @@ async def start(message: types.Message):
             logging.info(f"Добавлен новый пользователь {message.from_user.id}")
     await message.answer("✅ Ты подписан на напоминания!")
 
+
 # === /add ===
 @dp.message(Command("add"))
 async def add_task(message: types.Message):
@@ -64,11 +80,9 @@ async def add_task(message: types.Message):
         return
 
     try:
-        _, time_str, *task_text = message.text.split(" ", 2)
+        _, time_str, task_message = message.text.split(" ", 2)
         hour, minute = map(int, time_str.split(":"))
-        task_message = " ".join(task_text)
 
-        # Сохраняем в базу
         async with async_session() as session:
             session.add(Task(time=time_str, message=task_message))
             await session.commit()
@@ -87,6 +101,7 @@ async def add_task(message: types.Message):
         logging.error(e)
         await message.answer("⚠️ Ошибка! Формат: `/add 10:00 текст`", parse_mode="Markdown")
 
+
 # === /list ===
 @dp.message(Command("list"))
 async def list_tasks(message: types.Message):
@@ -102,6 +117,7 @@ async def list_tasks(message: types.Message):
         for i, t in enumerate(tasks, 1):
             text += f"{i}. {t.time} → {t.message}\n"
         await message.answer(text)
+
 
 # === /delete ===
 @dp.message(Command("delete"))
@@ -127,6 +143,7 @@ async def delete_task(message: types.Message):
         logging.error(e)
         await message.answer("⚠️ Ошибка! Используй: `/delete 1`")
 
+
 # === Поднять таблицы + загрузить задачи из базы ===
 async def load_tasks():
     async with async_session() as session:
@@ -143,6 +160,7 @@ async def load_tasks():
             scheduler.add_job(job, "cron", hour=hour, minute=minute)
         logging.info(f"Загружено {len(tasks)} задач из базы")
 
+
 # === Запуск ===
 async def main():
     async with engine.begin() as conn:
@@ -152,6 +170,7 @@ async def main():
     scheduler.start()
     logging.info("✅ Бот запущен")
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
