@@ -6,17 +6,19 @@ from aiogram.filters import CommandStart, Command
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy import Column, Integer, BigInteger, Boolean, String, Text, select, delete
+from sqlalchemy import Column, Integer, BigInteger, Boolean, String, Text, select
 from dotenv import load_dotenv
 
 # Логирование
 logging.basicConfig(level=logging.INFO)
-load_dotenv
+load_dotenv()
 
+# === Переменные окружения ===
 API_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "").split(","))) 
+ADMIN_IDS = set(map(int, os.getenv("ADMIN_IDS", "").split(",")))
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+# === Настройки бота и планировщика ===
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
 scheduler = AsyncIOScheduler(timezone="Asia/Almaty")
@@ -46,7 +48,10 @@ async def start(message: types.Message):
         user = await session.execute(select(User).where(User.telegram_id == message.from_user.id))
         user = user.scalars().first()
         if not user:
-            session.add(User(telegram_id=message.from_user.id, is_admin=(message.from_user.id == ADMIN_ID)))
+            session.add(User(
+                telegram_id=message.from_user.id,
+                is_admin=(message.from_user.id in ADMIN_IDS)
+            ))
             await session.commit()
             logging.info(f"Добавлен новый пользователь {message.from_user.id}")
     await message.answer("✅ Ты подписан на напоминания!")
@@ -54,7 +59,7 @@ async def start(message: types.Message):
 # === /add ===
 @dp.message(Command("add"))
 async def add_task(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
+    if message.from_user.id not in ADMIN_IDS:
         await message.answer("⛔ У тебя нет прав.")
         return
 
@@ -85,7 +90,7 @@ async def add_task(message: types.Message):
 # === /list ===
 @dp.message(Command("list"))
 async def list_tasks(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
+    if message.from_user.id not in ADMIN_IDS:
         return
     async with async_session() as session:
         result = await session.execute(select(Task))
@@ -101,7 +106,7 @@ async def list_tasks(message: types.Message):
 # === /delete ===
 @dp.message(Command("delete"))
 async def delete_task(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
+    if message.from_user.id not in ADMIN_IDS:
         return
     try:
         _, index_str = message.text.split(" ")
