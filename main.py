@@ -49,6 +49,13 @@ class User(Base):
     is_admin = Column(Boolean, default=False)
 
 
+class Subscription(Base):
+    __tablename__ = "subscriptions"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(BigInteger, nullable=False)  # ID пользователя из users
+    active = Column(Boolean, default=True)        # статус подписки
+
+
 class Task(Base):
     __tablename__ = "tasks"
     id = Column(Integer, primary_key=True)
@@ -56,19 +63,27 @@ class Task(Base):
     message = Column(Text, nullable=False)
 
 
-# === /start ===
 @dp.message(CommandStart())
 async def start(message: types.Message):
     async with async_session() as session:
+        # Проверка на существование пользователя
         result = await session.execute(select(User).where(User.telegram_id == message.from_user.id))
         user = result.scalars().first()
         if not user:
-            session.add(User(
+            user = User(
                 telegram_id=message.from_user.id,
                 is_admin=(message.from_user.id in ADMIN_IDS)
-            ))
+            )
+            session.add(user)
             await session.commit()
-            logging.info(f"Добавлен новый пользователь {message.from_user.id}")
+
+        # Проверка на подписку
+        result = await session.execute(select(Subscription).where(Subscription.user_id == message.from_user.id))
+        sub = result.scalars().first()
+        if not sub:
+            session.add(Subscription(user_id=message.from_user.id, active=True))
+            await session.commit()
+
     await message.answer("✅ Ты подписан на напоминания!")
 
 
@@ -100,6 +115,19 @@ async def add_task(message: types.Message):
     except Exception as e:
         logging.error(e)
         await message.answer("⚠️ Ошибка! Формат: `/add 10:00 текст`", parse_mode="Markdown")
+
+
+@dp.message(Command("unsubscribe"))
+async def unsubscribe(message: types.Message):
+    async with async_session() as session:
+        result = await session.execute(select(Subscription).where(Subscription.user_id == message.from_user.id))
+        sub = result.scalars().first()
+        if sub:
+            sub.active = False
+            await session.commit()
+            await message.answer("❌ Ты отписался от напоминаний.")
+        else:
+            await message.answer("⚠️ У тебя нет активной подписки.")
 
 
 # === /list ===
